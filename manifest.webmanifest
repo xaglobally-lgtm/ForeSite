@@ -1,0 +1,16 @@
+{
+  "name": "Foresite — Jobsites Intelligence",
+  "short_name": "Foresite",
+  "description": "Find problems before they cost you money.",
+  "start_url": "./foresite.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0b0e13",
+  "theme_color": "#0b0e13",
+  "lang": "en",
+  "categories": ["business", "productivity"],
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}
