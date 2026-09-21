@@ -1,8 +1,8 @@
-{
-  "rewrites": [
-    {
-      "source": "/:path*",
-      "destination": "/app/foresite.html"
-    }
-  ]
-}
+   {
+     "rewrites": [
+       {
+         "source": "/((?!foresite\\.html|manifest\\.webmanifest|sw\\.js|icon\\.svg).*)",
+         "destination": "/foresite.html"
+       }
+     ]
+   }
