@@ -1,0 +1,541 @@
+// Jobsite Intelligence — database schema
+// Ported from the master spec §12 (companies -> ... -> audit_logs).
+// Run: npx prisma migrate dev --name init
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------- Account / tenancy ----------
+
+model Company {
+  id             String   @id @default(cuid())
+  name           String
+  contractorType String?
+  timezone       String   @default("America/Chicago")
+  currency       String   @default("USD")
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  users         CompanyUser[]
+  projects      Project[]
+  assumptions   FinancialAssumption?
+  subscription  Subscription?
+  auditLogs     AuditLog[]
+}
+
+model User {
+  id             String    @id @default(cuid())
+  name           String?
+  email          String    @unique
+  emailVerified  DateTime? // required by the Auth.js Prisma adapter (email magic-link marks this on first verified sign-in)
+  image          String?
+  authProviderId String?
+  createdAt      DateTime  @default(now())
+
+  accounts       Account[]
+  sessions       Session[]
+  companies      CompanyUser[]
+  projectMembers ProjectMember[]
+  rawInputs      RawInput[]
+  feedback       Feedback[]
+  auditLogs      AuditLog[]
+  notifications  Notification[]
+}
+
+// ---------- Auth.js required models (Prisma adapter) ----------
+// Standard shape from https://authjs.dev/getting-started/adapters/prisma — do
+// not rename fields, the adapter reads them by exact name.
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+enum CompanyRole {
+  OWNER
+  ADMIN
+  MANAGER
+  FIELD
+}
+
+model CompanyUser {
+  id        String      @id @default(cuid())
+  companyId String
+  userId    String
+  role      CompanyRole @default(FIELD)
+  status    String      @default("ACTIVE")
+  createdAt DateTime    @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([companyId, userId])
+}
+
+// ---------- Projects ----------
+
+enum ProjectStatus {
+  ACTIVE
+  ON_HOLD
+  COMPLETE
+  CANCELLED
+}
+
+model Project {
+  id                   String        @id @default(cuid())
+  companyId            String
+  name                 String
+  clientName           String?
+  address              String?
+  contractValue        Decimal?      @db.Decimal(14, 2)
+  estimatedStart       DateTime?
+  estimatedCompletion  DateTime?
+  actualCompletion     DateTime?
+  projectManagerId     String?
+  status               ProjectStatus @default(ACTIVE)
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  company      Company         @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  members      ProjectMember[]
+  rawInputs    RawInput[]
+  events       Event[]
+  exposures    Exposure[]
+  alerts       Alert[]
+  actions      Action[]
+
+  @@index([companyId, status])
+}
+
+model ProjectMember {
+  id        String   @id @default(cuid())
+  projectId String
+  userId    String
+  role      String   @default("MEMBER")
+  createdAt DateTime @default(now())
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([projectId, userId])
+}
+
+// ---------- Capture ----------
+
+enum InputType {
+  VOICE
+  TEXT
+  PHOTO
+  PDF
+  EMAIL
+  CSV
+  EXCEL
+}
+
+enum ProcessingStatus {
+  PENDING
+  PROCESSING
+  DONE
+  FAILED
+}
+
+// Raw inputs are immutable evidence. AI interpretations (Events) may change or be
+// corrected; the original capture never does. See spec §12 / §60 rule 9.
+model RawInput {
+  id                String           @id @default(cuid())
+  companyId         String
+  projectId         String?
+  submittedById     String?
+  type              InputType
+  contentText       String?
+  fileUrl           String?
+  fileMediaType     String?
+  source            String           @default("app")
+  capturedAt        DateTime         @default(now())
+  createdAt         DateTime         @default(now())
+  processingStatus  ProcessingStatus @default(PENDING)
+
+  project     Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+  submittedBy User?    @relation(fields: [submittedById], references: [id], onDelete: SetNull)
+  events      Event[]
+
+  @@index([companyId, projectId])
+}
+
+// ---------- Events ----------
+
+enum EventType {
+  SCOPE_CHANGE
+  EXTRA_WORK
+  UNPRICED_WORK
+  WORK_STARTED_WITHOUT_APPROVAL
+  MATERIAL_DELAY
+  MATERIAL_SHORTAGE
+  MATERIAL_DAMAGE
+  MATERIAL_WRONG
+  CREW_DELAY
+  CREW_IDLE
+  CREW_UNAVAILABLE
+  TRADE_DELAY
+  DEPENDENCY_BLOCKED
+  REWORK
+  DEFECT
+  INSPECTION_FAILURE
+  CUSTOMER_REQUEST
+  CUSTOMER_COMPLAINT
+  CUSTOMER_APPROVAL_REQUIRED
+  SCHEDULE_RISK
+  MILESTONE_RISK
+  COMPLETION_RISK
+  DOCUMENTATION_GAP
+  APPROVAL_MISSING
+  RECURRING_PROBLEM
+}
+
+enum Severity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+}
+
+model Event {
+  id           String    @id @default(cuid())
+  companyId    String
+  projectId    String
+  sourceId     String?   // RawInput this was extracted from; null for synthetic events
+                          // (recurring-pattern / silent-risk detectors)
+  chainId      String?   // groups events cascaded from one input, for double-counting protection
+  type         EventType
+  title        String
+  description  String
+  status       String    @default("OPEN")
+  confidence   Float
+  fact         String?
+  signal       String?
+  inference    String?
+  recommendation String?
+  entities     String[]  @default([])
+  // structured, never-invented financial signals extracted from the source (spec §29)
+  affectedHours     Float?
+  materialQuantity  Float?
+  materialUnit      String?
+  knownUnitCost     Float?
+  statedDollarAmount Float?
+  probability  Int       // 0-100, spec §23
+  impact       Int       // 0-100, spec §24
+  urgency      Int       // 0-100, spec §25
+  severityScore Int
+  severity     Severity
+  occurredAt   DateTime  @default(now())
+  detectedAt   DateTime  @default(now())
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  project      Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  source       RawInput?      @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+  exposures    Exposure[]
+  alerts       Alert[]
+  fromRelations EventRelationship[] @relation("FromEvent")
+  toRelations   EventRelationship[] @relation("ToEvent")
+
+  @@index([companyId, projectId, type])
+  @@index([chainId])
+}
+
+enum RelationshipType {
+  CAUSES
+  MAY_CAUSE
+  DEPENDS_ON
+  AFFECTS
+  BLOCKS
+  PRECEDES
+  RELATED_TO
+  DUPLICATES
+  CONTRADICTS
+  RESOLVES
+}
+
+model EventRelationship {
+  id       String            @id @default(cuid())
+  fromId   String
+  toId     String
+  type     RelationshipType
+  createdAt DateTime         @default(now())
+
+  from Event @relation("FromEvent", fields: [fromId], references: [id], onDelete: Cascade)
+  to   Event @relation("ToEvent", fields: [toId], references: [id], onDelete: Cascade)
+
+  @@unique([fromId, toId, type])
+}
+
+// ---------- Financial ledger ----------
+
+enum ExposureCategory {
+  REVENUE_OPPORTUNITY
+  COST_EXPOSURE
+  SCHEDULE_EXPOSURE
+}
+
+enum ExposureStatus {
+  POTENTIAL
+  CONFIRMED
+  ACTIONED
+  REALIZED
+  DISMISSED
+  DUPLICATE
+}
+
+model Exposure {
+  id                 String           @id @default(cuid())
+  projectId          String
+  sourceEventId      String
+  category           ExposureCategory
+  lowAmount          Float?
+  highAmount         Float?
+  currency           String           @default("USD")
+  confidence         Float
+  calculationMethod  String
+  assumptionsSnapshot Json?
+  hasAmount          Boolean          @default(false)
+  status             ExposureStatus   @default(POTENTIAL)
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @updatedAt
+
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  event   Event   @relation(fields: [sourceEventId], references: [id], onDelete: Cascade)
+  alerts  Alert[]
+}
+
+// ---------- Alerts / actions / outcomes ----------
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  ACTIONED
+  DISMISSED
+  RESOLVED
+}
+
+model Alert {
+  id                 String      @id @default(cuid())
+  projectId          String
+  eventId            String
+  exposureId         String?
+  severity           Severity
+  title              String
+  summary            String
+  whyItMatters       String
+  recommendedAction  String
+  confidence         Float
+  status             AlertStatus @default(OPEN)
+  createdAt          DateTime    @default(now())
+  resolvedAt         DateTime?
+
+  project  Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  event    Event      @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  exposure Exposure?  @relation(fields: [exposureId], references: [id], onDelete: SetNull)
+  actions  Action[]
+  outcomes Outcome[]
+  feedback Feedback[]
+  notifications Notification[]
+
+  @@index([projectId, status, severity])
+}
+
+enum ActionStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+model Action {
+  id          String       @id @default(cuid())
+  alertId     String
+  projectId   String
+  assignedTo  String?
+  title       String
+  description String?
+  dueAt       DateTime?
+  status      ActionStatus @default(OPEN)
+  createdAt   DateTime     @default(now())
+  completedAt DateTime?
+
+  alert   Alert   @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+}
+
+enum OutcomeType {
+  REVENUE_CAPTURED
+  COST_AVOIDED
+  SCHEDULE_RECOVERED
+  ISSUE_RESOLVED
+  FALSE_POSITIVE
+  NO_ACTION_REQUIRED
+}
+
+model Outcome {
+  id          String      @id @default(cuid())
+  alertId     String
+  type        OutcomeType
+  amount      Float?
+  currency    String      @default("USD")
+  description String?
+  verified    Boolean     @default(false)
+  createdById String?
+  createdAt   DateTime    @default(now())
+
+  alert Alert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+}
+
+model Feedback {
+  id        String   @id @default(cuid())
+  alertId   String
+  userId    String?
+  verdict   String   // USEFUL | NOT_USEFUL | ALREADY_HANDLED | NOT_IMPORTANT
+  createdAt DateTime @default(now())
+
+  alert Alert @relation(fields: [alertId], references: [id], onDelete: Cascade)
+  user  User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+}
+
+// ---------- Configuration ----------
+
+model FinancialAssumption {
+  id                String  @id @default(cuid())
+  companyId         String  @unique
+  loadedLaborRate   Float   @default(65)
+  typicalCrewSize   Int     @default(4)
+  dailyOverhead     Float   @default(400)
+  defaultMarkup     Float   @default(0.18)
+  materialMarkup    Float   @default(0.12)
+  overtimeMultiplier Float  @default(1.5)
+  updatedAt         DateTime @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Billing ----------
+
+enum SubscriptionPlan {
+  STARTER
+  PRO
+  BUSINESS
+  TRIAL
+}
+
+model Subscription {
+  id                    String           @id @default(cuid())
+  companyId             String           @unique
+  stripeCustomerId      String?
+  stripeSubscriptionId  String?
+  plan                  SubscriptionPlan @default(TRIAL)
+  status                String           @default("trialing")
+  trialEnd              DateTime?
+  projectLimit          Int              @default(5)
+  createdAt             DateTime         @default(now())
+  updatedAt             DateTime         @updatedAt
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+}
+
+// ---------- Analytics ----------
+
+// Spec §64's event list, stored in your own Postgres rather than requiring a
+// third-party vendor by default — swap analytics.ts's track() body for a
+// PostHog/Segment/Amplitude call later without touching any call site.
+model AnalyticsEvent {
+  id        String   @id @default(cuid())
+  companyId String?  // null for pre-signup events (free_scan_started, signup_started)
+  userId    String?
+  name      String   // e.g. "alert_created", "free_scan_completed" — see spec §64
+  properties Json?
+  createdAt DateTime @default(now())
+
+  @@index([companyId, name, createdAt])
+  @@index([name, createdAt])
+}
+
+// ---------- Notifications ----------
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+// Delivery rule per spec §53: Critical -> immediate, High -> immediate or
+// digest, Medium -> daily digest, Low -> dashboard only (no push/email).
+model Notification {
+  id        String              @id @default(cuid())
+  companyId String
+  userId    String
+  alertId   String?
+  channel   NotificationChannel
+  severity  Severity
+  title     String
+  body      String
+  sentAt    DateTime?           // null until actually delivered (email queue, digest batch, etc.)
+  readAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  alert Alert? @relation(fields: [alertId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, userId, readAt])
+}
+
+// ---------- Audit ----------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  companyId  String
+  userId     String?
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json?
+  timestamp  DateTime @default(now())
+
+  company Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  user    User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([companyId, entityType, entityId])
+}
