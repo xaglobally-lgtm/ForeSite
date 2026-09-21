@@ -1375,7 +1375,14 @@ function freshState(){
     actions:[],
     outcomes:[],
     assumptions:{ laborRate:65, crewSize:4, dailyOverhead:400, markup:0.18, materialMarkup:0.12 },
-    settings:{ theme:'dark', currency:'USD', apiKey:'' },
+    settings:{
+      theme:'dark', currency:'USD', apiKey:'',
+      agingAlertDefaults:{ criticalMs: 24*60*60*1000, highMs: 72*60*60*1000 },
+      alertOverrides:{},
+      suppressedPatterns:[],
+      silentRiskConfig:{ weakSignalThreshold:45, minClusterSize:3, maxTimeWindow:7*24*60*60*1000, enabled:true },
+      signalFeedback:{}
+    },
     ui:{ tab:'inbox', selectedProject:'all', captureMode:'voice', alertDetail:null, askHistory:[], lang:'en', aboutExpanded:{}, splitRatios:{} },
     scan:null // temp free-scan session
   };
@@ -1392,6 +1399,7 @@ async function loadState(){
     }
   }catch(e){ /* no saved state yet */ }
   render();
+  initializeAllEnhancements();
 }
 let saveTimer=null;
 function saveState(){
@@ -1630,17 +1638,33 @@ async function processRawInput(rawInput){
 const AGING_THRESHOLDS_MS = { CRITICAL: 24*3600*1000, HIGH: 72*3600*1000 };
 function detectAgingAlerts(now){
   now = now ?? Date.now();
-  return state.alerts.filter(a=>{
-    if(a.status!=='OPEN') return false;
-    const threshold = AGING_THRESHOLDS_MS[a.severity];
-    if(!threshold) return false;
+  const defaults = state.settings?.agingAlertDefaults || {
+    criticalMs: 24 * 60 * 60 * 1000,
+    highMs: 72 * 60 * 60 * 1000
+  };
+
+  return state.alerts.filter(a => {
+    if (a.status !== 'OPEN') return false;
+
+    const customThreshold = state.settings?.alertOverrides?.[a.id]?.customMs;
+    const threshold = customThreshold !== undefined
+      ? customThreshold
+      : (a.severity === 'CRITICAL' ? defaults.criticalMs : defaults.highMs);
+
     return (now - a.createdAt) > threshold;
-  }).map(a=>({ alertId:a.id, ageHours: Math.round((now - a.createdAt)/3600000) }));
+  }).map(a => ({
+    alertId: a.id,
+    ageHours: Math.round((now - a.createdAt) / 3600000),
+    hasCustomReminder: !!state.settings?.alertOverrides?.[a.id],
+    overrideHours: state.settings?.alertOverrides?.[a.id]?.customMs
+      ? Math.round(state.settings.alertOverrides[a.id].customMs / 3600000)
+      : null
+  }));
 }
 
 function detectRecurringPatterns(){
   const created = [];
-  const byEntity = {}; // key: projectId::entity(lowercased) -> events
+  const byEntity = {};
   state.events.forEach(e=>{
     if(e.type==='RECURRING_PROBLEM') return;
     (e.entities||[]).forEach(ent=>{
@@ -1651,6 +1675,13 @@ function detectRecurringPatterns(){
   Object.entries(byEntity).forEach(([key, evs])=>{
     if(evs.length < 3) return;
     const [projectId, entity] = key.split('::');
+
+    const suppression = (state.settings?.suppressedPatterns || []).find(s => s.patternKey === key);
+    if(suppression){
+      if(suppression.action === 'once') return;
+      if(suppression.action === 'always') return;
+    }
+
     const alreadyFlagged = state.events.some(e=>e.type==='RECURRING_PROBLEM' && e.projectId===projectId && (e.entities||[]).includes(entity));
     if(alreadyFlagged) return;
     const types = [...new Set(evs.map(e=>e.type))];
@@ -1689,6 +1720,9 @@ function detectRecurringPatterns(){
 const SILENT_RISK_STOPWORDS = new Set(['this','that','from','been','have','still','again','today','after','need','needs','into','with','they','them','were','being','once','more','than','also']);
 function detectSilentRisk(projectId, newBatchEvents){
   const created = [];
+  const config = state.settings?.silentRiskConfig || { weakSignalThreshold:45, minClusterSize:3 };
+  if(!config.enabled) return created;
+
   const recent = state.events.filter(e=>e.projectId===projectId && e.type!=='RECURRING_PROBLEM' && e.chainId!==null).slice(0,25);
   newBatchEvents.forEach(evt=>{
     const evtEntities = new Set((evt.entities||[]).map(x=>x.toLowerCase()));
@@ -1701,7 +1735,7 @@ function detectSilentRisk(projectId, newBatchEvents){
       const t = (e.title+' '+e.description).toLowerCase();
       return words.some(w=>t.includes(w));
     });
-    if(related.length < 2) return; // need this event + 2 prior = 3 total weak signals
+    if(related.length < 2) return;
     const alreadyEscalated = state.alerts.some(a=>a.title.startsWith('Management attention required') && a.projectId===projectId && a.summary.includes(evt.title));
     if(alreadyEscalated) return;
     const allInvolved = [evt, ...related];
@@ -1824,6 +1858,117 @@ function guessProjectId(text){
 
 function sevBadge(sev){ return `<span class="badge badge-${sev.toLowerCase()}"><span class="dot dot-${sev.toLowerCase()}"></span>${t('sev_'+sev.toLowerCase())}</span>`; }
 function statusBadge(st){ return `<span class="badge badge-${st.toLowerCase()}">${t('st_'+st.toLowerCase().replace(/ /g,'_'))}</span>`; }
+
+// ===== ENHANCEMENT HELPERS: AGING ALERTS =====
+function setCustomAgingReminder(alertId, customHours) {
+  if (!state.settings.alertOverrides) state.settings.alertOverrides = {};
+  state.settings.alertOverrides[alertId] = {
+    customMs: customHours * 60 * 60 * 1000,
+    setAt: Date.now()
+  };
+  saveState();
+  console.log(`Custom reminder set for alert ${alertId}: ${customHours} hours`);
+}
+
+function getAgingThreshold(alert) {
+  const defaults = state.settings?.agingAlertDefaults || {
+    criticalMs: 24 * 60 * 60 * 1000,
+    highMs: 72 * 60 * 60 * 1000
+  };
+  const customThreshold = state.settings?.alertOverrides?.[alert.id]?.customMs;
+  return customThreshold !== undefined
+    ? customThreshold
+    : (alert.severity === 'CRITICAL' ? defaults.criticalMs : defaults.highMs);
+}
+
+function saveAgingDefaults(criticalHours, highHours) {
+  if (!state.settings.agingAlertDefaults) state.settings.agingAlertDefaults = {};
+  state.settings.agingAlertDefaults.criticalMs = criticalHours * 60 * 60 * 1000;
+  state.settings.agingAlertDefaults.highMs = highHours * 60 * 60 * 1000;
+  saveState();
+  console.log('✓ Aging defaults updated:', state.settings.agingAlertDefaults);
+  render();
+}
+
+// ===== ENHANCEMENT HELPERS: RECURRING PATTERNS =====
+function suppressPattern(patternKey, action = 'once', durationHours = 24) {
+  if (!state.settings.suppressedPatterns) state.settings.suppressedPatterns = [];
+
+  const existingIndex = state.settings.suppressedPatterns.findIndex(s => s.patternKey === patternKey);
+  if (existingIndex >= 0) {
+    state.settings.suppressedPatterns[existingIndex].action = action;
+    state.settings.suppressedPatterns[existingIndex].suppressedAt = Date.now();
+  } else {
+    state.settings.suppressedPatterns.push({
+      patternKey: patternKey,
+      action: action,
+      suppressedAt: Date.now(),
+      expiresAt: action === 'once' ? Date.now() + (durationHours * 60 * 60 * 1000) : null
+    });
+  }
+  saveState();
+  console.log(`✓ Pattern suppressed: ${patternKey} (${action})`);
+}
+
+function isPatternSuppressed(patternKey) {
+  const suppression = (state.settings?.suppressedPatterns || []).find(s => s.patternKey === patternKey);
+  if (!suppression) return false;
+  if (suppression.action === 'always') return true;
+  if (suppression.action === 'once' && suppression.expiresAt && Date.now() < suppression.expiresAt) return true;
+  return false;
+}
+
+function unsuppressPattern(patternKey) {
+  if (!state.settings.suppressedPatterns) return;
+  state.settings.suppressedPatterns = state.settings.suppressedPatterns.filter(s => s.patternKey !== patternKey);
+  saveState();
+  console.log(`✓ Pattern unsuppressed: ${patternKey}`);
+  render();
+}
+
+// ===== ENHANCEMENT HELPERS: SILENT RISK =====
+function updateSilentRiskConfig(threshold, minCluster, enabled) {
+  if (!state.settings.silentRiskConfig) state.settings.silentRiskConfig = {};
+  state.settings.silentRiskConfig.weakSignalThreshold = parseFloat(threshold);
+  state.settings.silentRiskConfig.minClusterSize = parseInt(minCluster);
+  state.settings.silentRiskConfig.enabled = enabled;
+  saveState();
+  console.log('✓ Silent Risk config updated:', state.settings.silentRiskConfig);
+  render();
+}
+
+function rateSignal(signalId, rating) {
+  if (!state.settings.signalFeedback) state.settings.signalFeedback = {};
+  state.settings.signalFeedback[signalId] = {
+    rating: rating,
+    ratedAt: Date.now()
+  };
+  saveState();
+  console.log(`✓ Signal ${signalId} rated ${rating}/5`);
+}
+
+function initializeAllEnhancements() {
+  if (!state.settings.agingAlertDefaults) {
+    state.settings.agingAlertDefaults = {
+      criticalMs: 24 * 60 * 60 * 1000,
+      highMs: 72 * 60 * 60 * 1000
+    };
+  }
+  if (!state.settings.alertOverrides) state.settings.alertOverrides = {};
+  if (!state.settings.suppressedPatterns) state.settings.suppressedPatterns = [];
+  if (!state.settings.silentRiskConfig) {
+    state.settings.silentRiskConfig = {
+      weakSignalThreshold: 45,
+      minClusterSize: 3,
+      maxTimeWindow: 7 * 24 * 60 * 60 * 1000,
+      enabled: true
+    };
+  }
+  if (!state.settings.signalFeedback) state.settings.signalFeedback = {};
+
+  saveState();
+  console.log('✅ All enhancements initialized');
+}
 
 function render(){
   applyDirection();
@@ -2592,6 +2737,27 @@ function renderSettings(){
     <div class="panel-title">${t('settings_reset')}</div>
     <p style="font-size:13px;color:var(--chalk-faint);">${t('settings_reset_sub')}</p>
     <button class="btn btn-ghost" id="resetAll">${t('settings_reset_btn')}</button>
+  </div>
+  <div class="panel" style="max-width:560px;">
+    <div class="panel-title">🎯 Alert Tuning Center</div>
+    <div style="border-left:4px solid var(--blue);background:var(--navy-panel);padding:15px;margin-bottom:15px;border-radius:4px;">
+      <h4 style="margin:0 0 10px 0;color:var(--chalk);">Aging Alerts</h4>
+      <div class="row2" style="gap:20px;">
+        <div class="field" style="flex:1;"><label>Critical Timeout (hours)</label><input type="number" id="criticalHours" min="1" max="168" value="${(state.settings?.agingAlertDefaults?.criticalMs || 24*3600*1000)/3600000}"></div>
+        <div class="field" style="flex:1;"><label>High Timeout (hours)</label><input type="number" id="highHours" min="1" max="168" value="${(state.settings?.agingAlertDefaults?.highMs || 72*3600*1000)/3600000}"></div>
+      </div>
+      <button class="btn btn-primary" onclick="saveAgingDefaults(document.getElementById('criticalHours').value, document.getElementById('highHours').value)">Save Aging Defaults</button>
+      <p style="font-size:12px;color:var(--chalk-faint);margin-top:10px;font-style:italic;">Set default escalation times for aged alerts</p>
+    </div>
+    <div style="border-left:4px solid var(--blue);background:var(--navy-panel);padding:15px;margin-bottom:15px;border-radius:4px;">
+      <h4 style="margin:0 0 10px 0;color:var(--chalk);">Silent Risk Detection</h4>
+      <div class="row2" style="gap:20px;">
+        <div class="field" style="flex:1;"><label>Weak Signal Threshold (%)</label><input type="range" id="signalThreshold" min="10" max="90" value="${state.settings?.silentRiskConfig?.weakSignalThreshold || 45}" style="width:100%;"></div>
+        <div class="field" style="flex:1;"><label>Min Cluster Size</label><input type="number" id="minCluster" min="2" max="10" value="${state.settings?.silentRiskConfig?.minClusterSize || 3}"></div>
+      </div>
+      <button class="btn btn-primary" onclick="updateSilentRiskConfig(document.getElementById('signalThreshold').value, document.getElementById('minCluster').value, true)">Update Config</button>
+      <p style="font-size:12px;color:var(--chalk-faint);margin-top:10px;font-style:italic;">Detect weak signals grouped by confidence threshold</p>
+    </div>
   </div>
   </div>`;
 }
